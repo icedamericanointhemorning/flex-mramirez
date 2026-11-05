@@ -62,5 +62,11 @@
     "type": "tr-workflow",
     "name": "/Internal Call/",
     "parent": "TWILIO_FLEX_WORKSPACE_SID"
+  },
+  "SMS_TEST_BOT_WORKFLOW_SID": {
+    "type": "tr-workflow",
+    "name": "Template Example Assign to Anyone",
+    "fallback": "/(Assign.*Anyone)/",
+    "parent": "TWILIO_FLEX_WORKSPACE_SID"
   }
 }

@@ -5,8 +5,15 @@
 // asks for an agent it hands the existing conversation to Flex through the
 // Interactions API, so the agent sees the full history.
 //
+// Outside business hours (per the Schedule Manager add-on), the bot sends a closed
+// reply instead. It records the contact as a task in the After Hours queue for
+// reporting, cancels that task straight away, and closes the conversation so the
+// guest's next text starts fresh.
+//
 // This is a protected function, so Twilio Functions validates X-Twilio-Signature
 // before the handler runs.
+const axios = require('axios');
+
 const { prepareStudioFunction, twilioExecute } = require(Runtime.getFunctions()['common/helpers/function-helper'].path);
 
 const BOT_AUTHOR = 'Test Bot';
@@ -20,6 +27,8 @@ const KEYWORD_REPLIES = {
 };
 
 const MENU_REPLY = `Hi! I'm a test bot. Text HOURS, ROOMS, or PARKING to learn more, or AGENT to talk to a person.`;
+
+const CLOSED_REPLY = 'Thanks for reaching out! We are currently closed. Please text us again between 9am and 5pm.';
 
 const ESCALATION_KEYWORDS = ['agent', 'human', 'person', 'representative'];
 
@@ -55,12 +64,31 @@ const getReply = (text) => {
   return keyword ? KEYWORD_REPLIES[keyword] : MENU_REPLY;
 };
 
-const escalate = async (context, conversationSid, guestAddress, attributes) => {
-  // Mark the conversation first so any texts that arrive mid-escalation are ignored.
-  await setAttributes(context, conversationSid, { ...attributes, escalated: true });
-  await sendBotMessage(context, conversationSid, 'Connecting you to an agent. One moment, please.');
+// Asks Schedule Manager whether we're open. Fails open, like Schedule Manager itself,
+// so a misconfiguration never turns guests away.
+const isOpen = async (context) => {
+  const { SCHEDULE_MANAGER_DOMAIN, SMS_TEST_BOT_SCHEDULE_NAME } = context;
+  if (!SCHEDULE_MANAGER_DOMAIN || !SMS_TEST_BOT_SCHEDULE_NAME) {
+    return true;
+  }
 
-  const result = await twilioExecute(context, (client) =>
+  try {
+    const { data } = await axios.get(`https://${SCHEDULE_MANAGER_DOMAIN}/check-schedule`, {
+      params: { name: SMS_TEST_BOT_SCHEDULE_NAME },
+      timeout: 5000,
+    });
+    if (data.error) {
+      console.error(`(${context.PATH}) Schedule check failed: ${data.error}`);
+    }
+    return data.isOpen !== false;
+  } catch (error) {
+    console.error(`(${context.PATH}) Schedule check failed: ${error}`);
+    return true;
+  }
+};
+
+const createInteraction = async (context, conversationSid, guestAddress, extraAttributes) =>
+  twilioExecute(context, (client) =>
     client.flexApi.v1.interaction.create({
       channel: {
         type: 'sms',
@@ -76,18 +104,58 @@ const escalate = async (context, conversationSid, guestAddress, attributes) => {
             from: guestAddress,
             customerName: guestAddress,
             customerAddress: guestAddress,
-            escalationReason: 'Guest asked for an agent',
+            ...extraAttributes,
           },
         },
       },
     }),
   );
 
+const escalate = async (context, conversationSid, guestAddress, attributes) => {
+  // Mark the conversation first so any texts that arrive mid-escalation are ignored.
+  await setAttributes(context, conversationSid, { ...attributes, escalated: true });
+  await sendBotMessage(context, conversationSid, 'Connecting you to an agent. One moment, please.');
+
+  const result = await createInteraction(context, conversationSid, guestAddress, {
+    escalationReason: 'Guest asked for an agent',
+  });
+
   if (!result.success) {
     console.error(`(${context.PATH}) Interaction create failed for ${conversationSid}: ${result.message}`);
     // Hand the conversation back to the bot so the guest isn't left waiting on nobody.
     await setAttributes(context, conversationSid, { ...attributes, escalated: false });
     await sendBotMessage(context, conversationSid, "Sorry, we couldn't reach an agent right now. Please try again.");
+  }
+};
+
+const handleAfterHours = async (context, conversationSid, guestAddress) => {
+  await sendBotMessage(context, conversationSid, CLOSED_REPLY);
+
+  // The workflow routes after_hours tasks to a queue no worker matches. Cancelling
+  // the task right away records the contact for reporting without leaving it queued.
+  const result = await createInteraction(context, conversationSid, guestAddress, { after_hours: true });
+  const taskSid = result.data?.routing?.properties?.sid;
+  if (!result.success || !taskSid) {
+    console.error(
+      `(${context.PATH}) After-hours task not recorded for ${conversationSid}: ${result.message || 'no task SID'}`,
+    );
+  } else {
+    const cancel = await twilioExecute(context, (client) =>
+      client.taskrouter.v1
+        .workspaces(context.TWILIO_FLEX_WORKSPACE_SID)
+        .tasks(taskSid)
+        .update({ assignmentStatus: 'canceled', reason: 'After hours' }),
+    );
+    if (!cancel.success) {
+      console.error(`(${context.PATH}) After-hours task ${taskSid} not canceled: ${cancel.message}`);
+    }
+  }
+
+  const close = await twilioExecute(context, (client) =>
+    client.conversations.v1.conversations(conversationSid).update({ state: 'closed' }),
+  );
+  if (!close.success) {
+    console.error(`(${context.PATH}) Conversation ${conversationSid} not closed: ${close.message}`);
   }
 };
 
@@ -116,6 +184,11 @@ exports.handler = prepareStudioFunction(requiredParameters, async (context, even
 
     const text = Body.trim().toLowerCase();
     if (COMPLIANCE_KEYWORDS.includes(text)) {
+      return callback(null, response);
+    }
+
+    if (!(await isOpen(context))) {
+      await handleAfterHours(context, ConversationSid, Author);
       return callback(null, response);
     }
 

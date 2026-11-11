@@ -1,6 +1,16 @@
 {
   "task_routing": {
-    "filters": [],
+    "filters": [
+      {
+        "filter_friendly_name": "After Hours",
+        "expression": "after_hours == true",
+        "targets": [
+          {
+            "queue": "${QUEUE_SID_TEMPLATE_EXAMPLE_AFTER_HOURS}"
+          }
+        ]
+      }
+    ],
     "default_filter": {
       "queue": "${QUEUE_SID_EVERYONE}"
     }
